@@ -133,7 +133,6 @@ func (pr *PJProjector) SetProperty(property string, val string) error {
 
 func (pr *PJProjector) SendRequest(request PJRequest) (*PJResponse, error) {
 	if err := request.Validate(); err != nil {
-		// malformed command, don't send
 		return nil, err
 	}
 
@@ -145,33 +144,64 @@ func (pr *PJProjector) SendRequest(request PJRequest) (*PJResponse, error) {
 	return response, nil
 }
 
+// sendRawRequest performs the request.
+//
+// Normally only one connection is required.
+//
+// Some PJLink Class 2 projectors may send:
+//
+//	%2LKUP=AA:BB:CC:DD:EE:FF
+//
+// and then close the TCP connection before sending the response to the
+// requested command.
+//
+// In that specific case we reconnect once and repeat the original command.
 func (pr *PJProjector) sendRawRequest(request PJRequest) (*PJResponse, error) {
+	var lastErr error
+
+	for attempt := 0; attempt < 2; attempt++ {
+		resp, retry, err := pr.sendRawRequestOnce(request)
+
+		if err == nil {
+			return resp, nil
+		}
+
+		lastErr = err
+
+		if !retry {
+			return resp, err
+		}
+
+		time.Sleep(200 * time.Millisecond)
+	}
+
+	return nil, lastErr
+}
+
+func (pr *PJProjector) sendRawRequestOnce(
+	request PJRequest,
+) (*PJResponse, bool, error) {
+
 	// Establish TCP connection with PJLink device.
 	connection, connectionError := pr.connectToPJLink()
-
 	if connectionError != nil {
-		return nil, connectionError
+		return nil, false, connectionError
 	}
 
 	defer connection.Close()
 
-	// Set timeout for the whole PJLink exchange.
-	if err := connection.SetDeadline(time.Now().Add(10 * time.Second)); err != nil {
-		return nil, errors.New(
+	// Timeout for complete PJLink exchange.
+	if err := connection.SetDeadline(
+		time.Now().Add(10 * time.Second),
+	); err != nil {
+		return nil, false, errors.New(
 			"failed to set PJLink connection deadline: " + err.Error(),
 		)
 	}
 
-	/*
-		Split PJLink messages by carriage return.
-
-		IMPORTANT:
-		If '\r' hasn't arrived yet, Scanner must request more data.
-
-		The old implementation returned bufio.ErrFinalToken here.
-		That could make Scanner treat a partial TCP packet as a complete
-		PJLink message.
-	*/
+	// PJLink messages end with carriage return: '\r'.
+	//
+	// If '\r' has not arrived yet, Scanner must request more network data.
 	onCarriageReturn := func(
 		data []byte,
 		atEOF bool,
@@ -194,34 +224,34 @@ func (pr *PJProjector) sendRawRequest(request PJRequest) (*PJResponse, error) {
 			return len(data), data, nil
 		}
 
-		// No '\r' yet.
-		// Tell Scanner to read more data.
+		// No complete PJLink line yet.
+		// Ask Scanner to read more data.
 		return 0, nil, nil
 	}
 
 	scanner := bufio.NewScanner(connection)
 	scanner.Split(onCarriageReturn)
 
-	// -------------------------------------------------------------------------
-	// Read PJLink greeting
+	//----------------------------------------------------------------------------------------------------------------//
+	// Read greeting
+	//----------------------------------------------------------------------------------------------------------------//
+
+	// Expected:
 	//
-	// Normally:
-	//
-	// PJLINK 0
+	//	PJLINK 0
 	//
 	// or:
 	//
-	// PJLINK 1 XXXXXXXX
-	// -------------------------------------------------------------------------
+	//	PJLINK 1 XXXXXXXX
 
 	if !scanner.Scan() {
 		if err := scanner.Err(); err != nil {
-			return nil, errors.New(
+			return nil, false, errors.New(
 				"failed to read PJLink greeting: " + err.Error(),
 			)
 		}
 
-		return nil, errors.New(
+		return nil, false, errors.New(
 			"PJLink connection closed before greeting",
 		)
 	}
@@ -229,43 +259,46 @@ func (pr *PJProjector) sendRawRequest(request PJRequest) (*PJResponse, error) {
 	challengeRaw := strings.TrimSpace(scanner.Text())
 	challenge := strings.Fields(challengeRaw)
 
-	if len(challenge) < 2 || challenge[0] != "PJLINK" {
-		return nil, errors.New(
+	if len(challenge) < 2 {
+		return nil, false, errors.New(
+			"invalid PJLink greeting: " + challengeRaw,
+		)
+	}
+
+	if challenge[0] != "PJLINK" {
+		return nil, false, errors.New(
 			"invalid PJLink greeting: " + challengeRaw,
 		)
 	}
 
 	seed := pr.checkAuthentication(challenge)
 
-	// If authentication is enabled but the challenge is malformed,
-	// do not continue with an invalid request.
 	if challenge[1] == "1" && seed == "" {
-		return nil, errors.New(
+		return nil, false, errors.New(
 			"invalid PJLink authentication challenge: " + challengeRaw,
 		)
 	}
+
+	//----------------------------------------------------------------------------------------------------------------//
+	// Build and send command
+	//----------------------------------------------------------------------------------------------------------------//
 
 	stringCommand := request.toRaw(
 		seed,
 		pr.Password,
 	)
 
-	// -------------------------------------------------------------------------
-	// Send command
-	// -------------------------------------------------------------------------
-
 	commandBytes := []byte(stringCommand)
 
 	n, err := connection.Write(commandBytes)
-
 	if err != nil {
-		return nil, errors.New(
+		return nil, false, errors.New(
 			"failed to send PJLink command: " + err.Error(),
 		)
 	}
 
 	if n != len(commandBytes) {
-		return nil, errors.New(
+		return nil, false, errors.New(
 			"failed to send complete PJLink command",
 		)
 	}
@@ -273,21 +306,11 @@ func (pr *PJProjector) sendRawRequest(request PJRequest) (*PJResponse, error) {
 	expectedClass := strconv.Itoa(request.Class)
 	expectedCommand := request.Command
 
-	// -------------------------------------------------------------------------
-	// Read responses
-	//
-	// Normal projector:
-	//
-	//	%1POWR=1
-	//
-	// Some Class 2 projectors:
-	//
-	//	%2LKUP=D0:D9:4F:E5:BB:67
-	//	%1POWR=1
-	//
-	// Therefore we keep reading until we receive the response belonging
-	// to the command we sent.
-	// -------------------------------------------------------------------------
+	gotLKUP := false
+
+	//----------------------------------------------------------------------------------------------------------------//
+	// Read response
+	//----------------------------------------------------------------------------------------------------------------//
 
 	for scanner.Scan() {
 		rawResponse := strings.TrimSpace(scanner.Text())
@@ -296,33 +319,31 @@ func (pr *PJProjector) sendRawRequest(request PJRequest) (*PJResponse, error) {
 			continue
 		}
 
-		// Authentication error from projector.
+		// PJLink authentication failure.
 		if strings.Contains(rawResponse, "ERRA") {
 			resp := NewPJResponse()
 
 			err := resp.Parse(rawResponse)
 			if err != nil {
-				return resp, err
+				return resp, false, err
 			}
 
-			return resp, errors.New("PJLink authentication error")
+			return resp, false, errors.New(
+				"PJLink authentication error",
+			)
 		}
 
-		/*
-			A valid command response looks like:
-
-			%1POWR=1
-			%1AVMT=OK
-			%2LKUP=AA:BB:CC:DD:EE:FF
-
-			Minimum structure:
-
-			% C C C C C =
-
-			0 1 2 3 4 5 6
-		*/
+		// Normal PJLink response examples:
+		//
+		//	%1POWR=1
+		//	%1POWR=0
+		//	%1AVMT=OK
+		//	%2LKUP=D0:D9:4F:E5:BB:67
+		//
+		// Minimum valid response structure:
+		//
+		//	%1XXXX=
 		if len(rawResponse) < 7 {
-			// Ignore unrelated/malformed asynchronous data.
 			continue
 		}
 
@@ -338,49 +359,69 @@ func (pr *PJProjector) sendRawRequest(request PJRequest) (*PJResponse, error) {
 
 		err := resp.Parse(rawResponse)
 		if err != nil {
-			return resp, err
+			return resp, false, err
 		}
 
-		/*
-			Ignore unsolicited PJLink Class 2 messages.
+		//----------------------------------------------------------------------------------------------------------------//
+		// Unsolicited Class 2 LKUP
+		//----------------------------------------------------------------------------------------------------------------//
 
-			Example:
+		if resp.Class == "2" && resp.Command == "LKUP" {
+			gotLKUP = true
 
-			Expected:
-			    Class   = 1
-			    Command = POWR
+			// Ignore it and continue waiting for our actual response.
+			continue
+		}
 
-			Received:
-			    Class   = 2
-			    Command = LKUP
+		//----------------------------------------------------------------------------------------------------------------//
+		// Other unsolicited PJLink message
+		//----------------------------------------------------------------------------------------------------------------//
 
-			This is not our command response, so continue reading.
-		*/
 		if resp.Class != expectedClass ||
 			resp.Command != expectedCommand {
 
 			continue
 		}
 
-		// This is the response to our command.
-		return resp, nil
+		//----------------------------------------------------------------------------------------------------------------//
+		// This is the actual response to our command.
+		//----------------------------------------------------------------------------------------------------------------//
+
+		return resp, false, nil
 	}
 
-	// Scanner stopped.
+	//----------------------------------------------------------------------------------------------------------------//
+	// Scanner stopped
+	//----------------------------------------------------------------------------------------------------------------//
+
 	if err := scanner.Err(); err != nil {
-		return nil, errors.New(
+		return nil, false, errors.New(
 			"failed to read PJLink response: " + err.Error(),
 		)
 	}
 
-	return nil, errors.New(
+	// Special behaviour observed on some projectors:
+	//
+	//	%2LKUP=...
+	//	EOF
+	//
+	// Request one reconnect/retry.
+	if gotLKUP {
+		return nil, true, errors.New(
+			"PJLink connection closed after LKUP",
+		)
+	}
+
+	return nil, false, errors.New(
 		"PJLink connection closed before expected response",
 	)
 }
 
-// attempt to establish a TCP socket with the specified IP:port
-// success: returns populated pjlinkConn struct and nil error
-// failure: returns empty pjlinkConn and error
+//--------------------------------------------------------------------------------------------------------------------//
+// Connection
+//--------------------------------------------------------------------------------------------------------------------//
+
+// attempts to establish a TCP socket with the specified IP:port
 func (pr *PJProjector) connectToPJLink() (net.Conn, error) {
 	protocol := "tcp"
 	timeout := 10
@@ -404,8 +445,12 @@ func (pr *PJProjector) connectToPJLink() (net.Conn, error) {
 	return connection, nil
 }
 
+//--------------------------------------------------------------------------------------------------------------------//
+// Authentication
+//--------------------------------------------------------------------------------------------------------------------//
+
 // check if this Projector uses authentication.
-// If so return the given seed.
+// If so return the seed.
 // Otherwise return an empty string.
 func (pr *PJProjector) checkAuthentication(response []string) string {
 	if len(response) < 2 {
@@ -418,7 +463,7 @@ func (pr *PJProjector) checkAuthentication(response []string) string {
 
 	switch response[1] {
 	case "0":
-		// No authentication.
+		// Authentication disabled.
 		return ""
 
 	case "1":
