@@ -3,6 +3,8 @@ package pjlink
 import (
 	"bufio"
 	"errors"
+	"fmt"
+	"io"
 	"net"
 	"strconv"
 	"strings"
@@ -26,10 +28,12 @@ func NewProjector(IP string, password string) *PJProjector {
 }
 
 //--------------------------------------------------------------------------------------------------------------------//
-//--------------- Functional Calls -----------------------------------------------------------------------------------//
+// Functional Calls
 //--------------------------------------------------------------------------------------------------------------------//
 
-//--------------- Power ----------------------------------------------------------------------------------------------//
+//--------------------------------------------------------------------------------------------------------------------//
+// Power
+//--------------------------------------------------------------------------------------------------------------------//
 
 func (pr *PJProjector) GetPowerStatus() (*PJResponse, error) {
 	req := PJRequest{
@@ -80,14 +84,13 @@ func (pr *PJProjector) TurnOff() error {
 }
 
 func (pr *PJProjector) GetProperty(property string) (string, error) {
-	var request PJRequest
-
-	request.Class = 1
-	request.Command = property
-	request.Parameter = "?"
+	request := PJRequest{
+		Class:     1,
+		Command:   property,
+		Parameter: "?",
+	}
 
 	resp, err := pr.SendRequest(request)
-
 	if err != nil {
 		return "", err
 	}
@@ -100,27 +103,26 @@ func (pr *PJProjector) GetProperty(property string) (string, error) {
 }
 
 func (pr *PJProjector) GetPropertyArray(property string) ([]string, error) {
-	var request PJRequest
-
-	request.Class = 1
-	request.Command = property
-	request.Parameter = "?"
+	request := PJRequest{
+		Class:     1,
+		Command:   property,
+		Parameter: "?",
+	}
 
 	resp, err := pr.SendRequest(request)
-
 	if err != nil {
-		return make([]string, 0), err
+		return []string{}, err
 	}
 
 	return resp.Response, nil
 }
 
 func (pr *PJProjector) SetProperty(property string, val string) error {
-	var request PJRequest
-
-	request.Class = 1
-	request.Command = property
-	request.Parameter = val
+	request := PJRequest{
+		Class:     1,
+		Command:   property,
+		Parameter: val,
+	}
 
 	_, err := pr.SendRequest(request)
 
@@ -136,154 +138,140 @@ func (pr *PJProjector) SendRequest(request PJRequest) (*PJResponse, error) {
 		return nil, err
 	}
 
-	response, requestError := pr.sendRawRequest(request)
-	if requestError != nil {
-		return nil, requestError
-	}
-
-	return response, nil
+	return pr.sendRawRequest(request)
 }
 
-// sendRawRequest performs the request.
+//--------------------------------------------------------------------------------------------------------------------//
+// PJLink line reader
+//--------------------------------------------------------------------------------------------------------------------//
+
+// readPJLinkLine reads one PJLink message terminated by '\r'.
 //
-// Normally only one connection is required.
+// Some projectors pad their TCP packets with NUL bytes:
 //
-// Some PJLink Class 2 projectors may send:
+//	PJLINK 0\r\x00\x00\x00...
+//	%2LKUP=...\r\x00\x00...
+//	%1POWR=1\r\x00\x00...
 //
-//	%2LKUP=AA:BB:CC:DD:EE:FF
-//
-// and then close the TCP connection before sending the response to the
-// requested command.
-//
-// In that specific case we reconnect once and repeat the original command.
+// This function removes that padding and returns only the actual PJLink line.
+func readPJLinkLine(reader *bufio.Reader) (string, error) {
+	for {
+		raw, err := reader.ReadString('\r')
+
+		/*
+			ReadString can return both data and io.EOF.
+
+			If data exists, process it first.
+		*/
+		if len(raw) > 0 {
+			// Remove carriage return.
+			raw = strings.TrimSuffix(raw, "\r")
+
+			// Remove NUL padding and normal whitespace
+			// from both sides.
+			raw = strings.Trim(
+				raw,
+				"\x00 \t\r\n",
+			)
+
+			if raw != "" {
+				return raw, nil
+			}
+		}
+
+		if err != nil {
+			return "", err
+		}
+	}
+}
+
+//--------------------------------------------------------------------------------------------------------------------//
+// Raw request
+//--------------------------------------------------------------------------------------------------------------------//
+
 func (pr *PJProjector) sendRawRequest(request PJRequest) (*PJResponse, error) {
-	var lastErr error
-
-	for attempt := 0; attempt < 2; attempt++ {
-		resp, retry, err := pr.sendRawRequestOnce(request)
-
-		if err == nil {
-			return resp, nil
-		}
-
-		lastErr = err
-
-		if !retry {
-			return resp, err
-		}
-
-		time.Sleep(200 * time.Millisecond)
+	connection, err := pr.connectToPJLink()
+	if err != nil {
+		return nil, err
 	}
-
-	return nil, lastErr
-}
-
-func (pr *PJProjector) sendRawRequestOnce(
-	request PJRequest,
-) (*PJResponse, bool, error) {
-
-	// Establish TCP connection with PJLink device.
-	connection, connectionError := pr.connectToPJLink()
-	if connectionError != nil {
-		return nil, false, connectionError
-	}
-
 	defer connection.Close()
 
-	// Timeout for complete PJLink exchange.
-	if err := connection.SetDeadline(
+	// Maximum time for the complete exchange.
+	err = connection.SetDeadline(
 		time.Now().Add(10 * time.Second),
-	); err != nil {
-		return nil, false, errors.New(
-			"failed to set PJLink connection deadline: " + err.Error(),
-		)
-	}
-
-	// PJLink messages end with carriage return: '\r'.
-	//
-	// If '\r' has not arrived yet, Scanner must request more network data.
-	onCarriageReturn := func(
-		data []byte,
-		atEOF bool,
-	) (
-		advance int,
-		token []byte,
-		err error,
-	) {
-		for i := 0; i < len(data); i++ {
-			if data[i] == '\r' {
-				return i + 1, data[:i], nil
-			}
-		}
-
-		if atEOF {
-			if len(data) == 0 {
-				return 0, nil, nil
-			}
-
-			return len(data), data, nil
-		}
-
-		// No complete PJLink line yet.
-		// Ask Scanner to read more data.
-		return 0, nil, nil
-	}
-
-	scanner := bufio.NewScanner(connection)
-	scanner.Split(onCarriageReturn)
-
-	//----------------------------------------------------------------------------------------------------------------//
-	// Read greeting
-	//----------------------------------------------------------------------------------------------------------------//
-
-	// Expected:
-	//
-	//	PJLINK 0
-	//
-	// or:
-	//
-	//	PJLINK 1 XXXXXXXX
-
-	if !scanner.Scan() {
-		if err := scanner.Err(); err != nil {
-			return nil, false, errors.New(
-				"failed to read PJLink greeting: " + err.Error(),
-			)
-		}
-
-		return nil, false, errors.New(
-			"PJLink connection closed before greeting",
-		)
-	}
-
-	challengeRaw := strings.Trim(
-		scanner.Text(),
-		"\x00 \t\r\n",
 	)
-	challenge := strings.Fields(challengeRaw)
+	if err != nil {
+		return nil, fmt.Errorf(
+			"failed to set PJLink connection deadline: %w",
+			err,
+		)
+	}
+
+	reader := bufio.NewReader(connection)
+
+	//----------------------------------------------------------------------------------------------------------------//
+	// Greeting
+	//----------------------------------------------------------------------------------------------------------------//
+
+	/*
+		Normal projectors:
+
+			PJLINK 0
+
+		Password protected:
+
+			PJLINK 1 XXXXXXXX
+
+		Your projector actually sends something like:
+
+			PJLINK 0\r
+			\x00\x00\x00...
+
+		readPJLinkLine() removes that padding.
+	*/
+
+	greeting, err := readPJLinkLine(reader)
+	if err != nil {
+		return nil, fmt.Errorf(
+			"failed to read PJLink greeting: %w",
+			err,
+		)
+	}
+
+	challenge := strings.Fields(greeting)
 
 	if len(challenge) < 2 {
-		return nil, false, errors.New(
-			"invalid PJLink greeting: " + challengeRaw,
+		return nil, fmt.Errorf(
+			"invalid PJLink greeting: %q",
+			greeting,
 		)
 	}
 
 	if challenge[0] != "PJLINK" {
-		return nil, false, errors.New(
-			"invalid PJLink greeting: " + challengeRaw,
+		return nil, fmt.Errorf(
+			"invalid PJLink greeting: %q",
+			greeting,
+		)
+	}
+
+	if challenge[1] != "0" && challenge[1] != "1" {
+		return nil, fmt.Errorf(
+			"invalid PJLink authentication mode: %q",
+			greeting,
 		)
 	}
 
 	seed := pr.checkAuthentication(challenge)
 
 	if challenge[1] == "1" && seed == "" {
-		return nil, false, errors.New(
-			"invalid PJLink authentication challenge: " + challengeRaw,
+		return nil, fmt.Errorf(
+			"invalid PJLink authentication challenge: %q",
+			greeting,
 		)
 	}
 
 	//----------------------------------------------------------------------------------------------------------------//
-	// Build and send command
+	// Build command
 	//----------------------------------------------------------------------------------------------------------------//
 
 	stringCommand := request.toRaw(
@@ -293,62 +281,99 @@ func (pr *PJProjector) sendRawRequestOnce(
 
 	commandBytes := []byte(stringCommand)
 
+	//----------------------------------------------------------------------------------------------------------------//
+	// Send command
+	//----------------------------------------------------------------------------------------------------------------//
+
 	n, err := connection.Write(commandBytes)
 	if err != nil {
-		return nil, false, errors.New(
-			"failed to send PJLink command: " + err.Error(),
+		return nil, fmt.Errorf(
+			"failed to send PJLink command: %w",
+			err,
 		)
 	}
 
 	if n != len(commandBytes) {
-		return nil, false, errors.New(
-			"failed to send complete PJLink command",
+		return nil, fmt.Errorf(
+			"failed to send complete PJLink command: wrote %d/%d bytes",
+			n,
+			len(commandBytes),
 		)
 	}
 
 	expectedClass := strconv.Itoa(request.Class)
 	expectedCommand := request.Command
 
-	gotLKUP := false
-
 	//----------------------------------------------------------------------------------------------------------------//
-	// Read response
+	// Read responses
 	//----------------------------------------------------------------------------------------------------------------//
 
-	for scanner.Scan() {
-		rawResponse := strings.Trim(
-			scanner.Text(),
-			"\x00 \t\r\n",
-		)
+	/*
+		Normal projector:
 
-		if rawResponse == "" {
-			continue
-		}
+			-> %1POWR ?
+			<- %1POWR=1
 
-		// PJLink authentication failure.
-		if strings.Contains(rawResponse, "ERRA") {
-			resp := NewPJResponse()
+		Your projector:
 
-			err := resp.Parse(rawResponse)
-			if err != nil {
-				return resp, false, err
+			-> %1POWR ?
+
+			<- %2LKUP=D0:D9:4F:E5:BB:67
+			   + lots of NUL bytes
+
+			<- %1POWR=1
+			   + lots of NUL bytes
+
+		We ignore responses belonging to other commands and continue
+		until the requested command arrives.
+	*/
+
+	for {
+		rawResponse, err := readPJLinkLine(reader)
+
+		if err != nil {
+			if errors.Is(err, io.EOF) {
+				return nil, errors.New(
+					"PJLink connection closed before expected response",
+				)
 			}
 
-			return resp, false, errors.New(
-				"PJLink authentication error",
+			return nil, fmt.Errorf(
+				"failed to read PJLink response: %w",
+				err,
 			)
 		}
 
-		// Normal PJLink response examples:
-		//
-		//	%1POWR=1
-		//	%1POWR=0
-		//	%1AVMT=OK
-		//	%2LKUP=D0:D9:4F:E5:BB:67
-		//
-		// Minimum valid response structure:
-		//
-		//	%1XXXX=
+		//----------------------------------------------------------------------------------------------------------------//
+		// Authentication failure
+		//----------------------------------------------------------------------------------------------------------------//
+
+		if strings.Contains(rawResponse, "ERRA") {
+			return nil, errors.New(
+				"Incorrect password",
+			)
+		}
+
+		//----------------------------------------------------------------------------------------------------------------//
+		// Validate basic format
+		//----------------------------------------------------------------------------------------------------------------//
+
+		/*
+			Minimum:
+
+				%1POWR=
+
+			Indexes:
+
+				0  %
+				1  class
+				2  P
+				3  O
+				4  W
+				5  R
+				6  =
+		*/
+
 		if len(rawResponse) < 7 {
 			continue
 		}
@@ -361,90 +386,71 @@ func (pr *PJProjector) sendRawRequestOnce(
 			continue
 		}
 
+		//----------------------------------------------------------------------------------------------------------------//
+		// Parse response
+		//----------------------------------------------------------------------------------------------------------------//
+
 		resp := NewPJResponse()
 
-		err := resp.Parse(rawResponse)
+		err = resp.Parse(rawResponse)
 		if err != nil {
-			return resp, false, err
+			return resp, err
 		}
 
 		//----------------------------------------------------------------------------------------------------------------//
-		// Unsolicited Class 2 LKUP
-		//----------------------------------------------------------------------------------------------------------------//
-
-		if resp.Class == "2" && resp.Command == "LKUP" {
-			gotLKUP = true
-
-			// Ignore it and continue waiting for our actual response.
-			continue
-		}
-
-		//----------------------------------------------------------------------------------------------------------------//
-		// Other unsolicited PJLink message
+		// Is this response for our command?
 		//----------------------------------------------------------------------------------------------------------------//
 
 		if resp.Class != expectedClass ||
 			resp.Command != expectedCommand {
 
+			/*
+				Example:
+
+					expected:
+						Class   = 1
+						Command = POWR
+
+					received:
+						Class   = 2
+						Command = LKUP
+
+				This is an unsolicited PJLink message.
+				Ignore it.
+			*/
+
 			continue
 		}
 
 		//----------------------------------------------------------------------------------------------------------------//
-		// This is the actual response to our command.
+		// Correct response
 		//----------------------------------------------------------------------------------------------------------------//
 
-		return resp, false, nil
+		return resp, nil
 	}
-
-	//----------------------------------------------------------------------------------------------------------------//
-	// Scanner stopped
-	//----------------------------------------------------------------------------------------------------------------//
-
-	if err := scanner.Err(); err != nil {
-		return nil, false, errors.New(
-			"failed to read PJLink response: " + err.Error(),
-		)
-	}
-
-	// Special behaviour observed on some projectors:
-	//
-	//	%2LKUP=...
-	//	EOF
-	//
-	// Request one reconnect/retry.
-	if gotLKUP {
-		return nil, true, errors.New(
-			"PJLink connection closed after LKUP",
-		)
-	}
-
-	return nil, false, errors.New(
-		"PJLink connection closed before expected response",
-	)
 }
 
 //--------------------------------------------------------------------------------------------------------------------//
 // Connection
 //--------------------------------------------------------------------------------------------------------------------//
 
-// attempts to establish a TCP socket with the specified IP:port
 func (pr *PJProjector) connectToPJLink() (net.Conn, error) {
 	protocol := "tcp"
-	timeout := 10
+	timeout := 10 * time.Second
 
-	connection, connectionError := net.DialTimeout(
+	connection, err := net.DialTimeout(
 		protocol,
 		net.JoinHostPort(
 			pr.Address,
 			pr.Port,
 		),
-		time.Duration(timeout)*time.Second,
+		timeout,
 	)
 
-	if connectionError != nil {
-		return connection, errors.New(
-			"failed to establish a connection with pjlink device. error msg: " +
-				connectionError.Error(),
+	if err != nil {
+		return nil, fmt.Errorf(
+			"failed to establish a connection with pjlink device: %w",
+			err,
 		)
 	}
 
@@ -455,9 +461,13 @@ func (pr *PJProjector) connectToPJLink() (net.Conn, error) {
 // Authentication
 //--------------------------------------------------------------------------------------------------------------------//
 
-// check if this Projector uses authentication.
-// If so return the seed.
-// Otherwise return an empty string.
+// checkAuthentication checks whether the projector requires authentication.
+//
+// PJLINK 0
+//	-> no authentication.
+//
+// PJLINK 1 XXXXXXXX
+//	-> XXXXXXXX is the authentication seed.
 func (pr *PJProjector) checkAuthentication(response []string) string {
 	if len(response) < 2 {
 		return ""
@@ -469,11 +479,9 @@ func (pr *PJProjector) checkAuthentication(response []string) string {
 
 	switch response[1] {
 	case "0":
-		// Authentication disabled.
 		return ""
 
 	case "1":
-		// Authentication enabled.
 		if len(response) < 3 {
 			return ""
 		}
