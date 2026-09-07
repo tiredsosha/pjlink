@@ -256,7 +256,10 @@ func (pr *PJProjector) sendRawRequestOnce(
 		)
 	}
 
-	challengeRaw := strings.TrimSpace(scanner.Text())
+	challengeRaw := strings.Trim(
+		scanner.Text(),
+		"\x00 \t\r\n",
+	)
 	challenge := strings.Fields(challengeRaw)
 
 	if len(challenge) < 2 {
@@ -313,7 +316,10 @@ func (pr *PJProjector) sendRawRequestOnce(
 	//----------------------------------------------------------------------------------------------------------------//
 
 	for scanner.Scan() {
-		rawResponse := strings.TrimSpace(scanner.Text())
+		rawResponse := strings.Trim(
+			scanner.Text(),
+			"\x00 \t\r\n",
+		)
 
 		if rawResponse == "" {
 			continue
