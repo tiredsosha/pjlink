@@ -247,7 +247,7 @@ func (pr *PJProjector) sendRawRequest(request PJRequest) (*PJResponse, error) {
 		)
 	}
 
-	if challenge[0] != "PJLINK" {
+	if !strings.EqualFold(challenge[0], "PJLINK") {
 		return nil, fmt.Errorf(
 			"invalid PJLink greeting: %q",
 			greeting,
