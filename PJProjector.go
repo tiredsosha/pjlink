@@ -473,7 +473,7 @@ func (pr *PJProjector) checkAuthentication(response []string) string {
 		return ""
 	}
 
-	if response[0] != "PJLINK" {
+	if !strings.EqualFold(challenge[0], "PJLINK") {
 		return ""
 	}
 
